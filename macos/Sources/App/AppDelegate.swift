@@ -328,6 +328,7 @@ class AppDelegate: NSObject,
 
         // Setup our menu
         setupMenuImages()
+        setupTabSidebarMenu()
 
         // Setup signal handlers
         setupSignals()
@@ -1155,6 +1156,24 @@ extension AppDelegate {
         dockMenu.addItem(newTab)
     }
 
+    /// Adds the tab sidebar toggle to the end of the View menu.
+    private func setupTabSidebarMenu() {
+        guard let viewMenu = menuTerminalInspector?.menu else { return }
+        let item = NSMenuItem(
+            title: "Hide Tab Sidebar",
+            action: #selector(toggleTabSidebar(_:)),
+            keyEquivalent: "s")
+        item.keyEquivalentModifierMask = .command
+        item.target = self
+        item.setImageIfDesired(systemSymbolName: "sidebar.left")
+        viewMenu.addItem(.separator())
+        viewMenu.addItem(item)
+    }
+
+    @IBAction func toggleTabSidebar(_ sender: Any?) {
+        TerminalTabSidebar.isVisible.toggle()
+    }
+
     /// Setup all the images for our menu items.
     private func setupMenuImages() {
         // Note: This COULD Be done all in the xib file, but I find it easier to
@@ -1340,6 +1359,10 @@ extension AppDelegate: NSMenuItemValidation {
             // Float on top items only active if the key window is a primary
             // terminal window (not quick terminal).
             return NSApp.keyWindow is TerminalWindow
+
+        case #selector(toggleTabSidebar(_:)):
+            item.title = TerminalTabSidebar.isVisible ? "Hide Tab Sidebar" : "Show Tab Sidebar"
+            return true
 
         case #selector(undo(_:)):
             if undoManager.canUndo {

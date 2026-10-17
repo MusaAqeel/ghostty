@@ -1113,15 +1113,23 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         }
 
         // Initialize our content view to the SwiftUI root
+        let tabSidebarModel = TerminalTabSidebarModel(window: window)
         let container = TerminalViewContainer {
-            TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+            TerminalTabSidebarLayout(model: tabSidebarModel) {
+                TerminalView(ghostty: ghostty, viewModel: self, delegate: self)
+            }
         }
 
         // Set the initial content size on the container so that
         // intrinsicContentSize returns the correct value immediately,
         // without waiting for @FocusedValue to propagate through the
-        // SwiftUI focus chain.
-        container.initialContentSize = focusedSurface?.initialSize
+        // SwiftUI focus chain. The tab sidebar adds to the terminal's size.
+        container.initialContentSize = focusedSurface?.initialSize.map { size in
+            guard TerminalTabSidebar.isVisible else { return size }
+            return NSSize(
+                width: size.width + TerminalTabSidebar.currentWidth + TerminalTabSidebar.divider,
+                height: size.height)
+        }
 
         window.contentView = container
 

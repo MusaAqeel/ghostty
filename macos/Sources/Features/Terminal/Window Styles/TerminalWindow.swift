@@ -12,6 +12,9 @@ class TerminalWindow: NSWindow {
     /// Posted when a terminal window will close
     static let terminalWillCloseNotification = Notification.Name("TerminalWindowWillClose")
 
+    /// Posted when a terminal window's title changes, so the tab sidebar can relabel.
+    static let titleDidChangeNotification = Notification.Name("TerminalWindowTitleDidChange")
+
     /// This is the key in UserDefaults to use for the default `level` value. This is
     /// used by the manual float on top menu item feature.
     static let defaultLevelKey: String = "TerminalDefaultLevel"
@@ -37,6 +40,9 @@ class TerminalWindow: NSWindow {
 
     /// Sets up our tab context menu
     private var tabMenuObserver: NSObjectProtocol?
+
+    /// Swaps the native tab bar when the tab sidebar is shown or hidden.
+    private var tabSidebarObserver: NSObjectProtocol?
 
     /// Handles inline tab title editing for this host window.
     private(set) lazy var tabTitleEditor = TabTitleEditor(
@@ -93,6 +99,14 @@ class TerminalWindow: NSWindow {
         ) { [weak self] n in
             guard let self, let menu = n.object as? NSMenu else { return }
             self.configureTabContextMenuIfNeeded(menu)
+        }
+
+        tabSidebarObserver = NotificationCenter.default.addObserver(
+            forName: TerminalTabSidebar.visibilityDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.syncNativeTabBarVisibility()
         }
 
         // This is required so that window restoration properly creates our tabs
@@ -219,6 +233,7 @@ class TerminalWindow: NSWindow {
         } else {
             tabBarDidDisappear()
         }
+        syncNativeTabBarVisibility()
         viewModel.isMainWindow = true
     }
 
@@ -260,6 +275,7 @@ class TerminalWindow: NSWindow {
         // it. This has been verified to work on macOS 12 to 26
         if isTabBar(childViewController) {
             childViewController.identifier = Self.tabBarIdentifier
+            childViewController.isHidden = TerminalTabSidebar.isVisible
             tabBarDidAppear()
         }
     }
@@ -300,6 +316,15 @@ class TerminalWindow: NSWindow {
         // View controllers should be tagged with this as soon as possible to
         // increase our accuracy. We do this manually.
         return childViewController.identifier == Self.tabBarIdentifier
+    }
+
+    /// The tab sidebar replaces the horizontal tab bar. Tabs stay native, so only the
+    /// bar is hidden and every tab shortcut keeps working.
+    func syncNativeTabBarVisibility() {
+        let hidden = TerminalTabSidebar.isVisible
+        for controller in titlebarAccessoryViewControllers where isTabBar(controller) {
+            if controller.isHidden != hidden { controller.isHidden = hidden }
+        }
     }
 
     private func tabBarDidAppear() {
@@ -394,6 +419,7 @@ class TerminalWindow: NSWindow {
             guard title != oldValue else { return }
 
             syncWindowTitleAppearance()
+            NotificationCenter.default.post(name: Self.titleDidChangeNotification, object: self)
         }
     }
 

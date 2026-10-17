@@ -1,3 +1,34 @@
+> [!NOTE]
+>
+> **This is an unofficial fork of [Ghostty](https://github.com/ghostty-org/ghostty)**
+> and is not affiliated with or endorsed by the Ghostty project. It adds
+> **vertical tabs** to the macOS app: a left sidebar that lists every tab in
+> the window with its full title, replacing the horizontal tab bar.
+>
+> - Click a row to switch tabs; hover to show a close button; right-click to
+>   rename or close. Tabs stay native, so `new_tab`, `goto_tab` and the other
+>   tab keybindings work as before.
+> - **View → Hide/Show Tab Sidebar** (<kbd>⌘</kbd><kbd>S</kbd>) toggles it and
+>   brings the horizontal tab bar back.
+> - Drag the divider to resize it (240–520pt); the width is remembered.
+>
+> The sidebar lives in
+> [`macos/Sources/Features/Terminal/TabSidebar`](macos/Sources/Features/Terminal/TabSidebar).
+> Everything else tracks upstream Ghostty, and the original MIT license applies.
+>
+> **Building** (Apple Silicon, Xcode 26, [Zig 0.16.0](https://ziglang.org/download/)):
+>
+> ```sh
+> zig build -Demit-macos-app=false -Dxcframework-target=native -Doptimize=ReleaseFast -Di18n=false
+> mkdir -p zig-out/share/locale   # only needed with -Di18n=false
+> cd macos && xcodebuild -project Ghostty.xcodeproj -scheme Ghostty -configuration ReleaseLocal \
+>   -destination 'platform=macOS,arch=arm64' ARCHS=arm64 ONLY_ACTIVE_ARCH=YES SYMROOT="$PWD/build" build
+> open -n build/ReleaseLocal/Ghostty.app
+> ```
+>
+> Drop `-Di18n=false` and the `mkdir` line if GNU gettext (`msgfmt`) is installed.
+> The build keeps Ghostty's bundle ID, so it shares your Ghostty config.
+
 <!-- LOGO -->
 <h1>
 <p align="center">

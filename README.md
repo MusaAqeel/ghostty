@@ -5,12 +5,16 @@
 > **vertical tabs** to the macOS app: a left sidebar that lists every tab in
 > the window with its full title, replacing the horizontal tab bar.
 >
-> - Click a row to switch tabs; hover to show a close button; right-click to
->   rename or close. Tabs stay native, so `new_tab`, `goto_tab` and the other
->   tab keybindings work as before.
+> - Colors and the title font follow your terminal theme and config.
+> - Click a row to switch tabs, drag rows to reorder them, and right-click to
+>   rename, archive or close. Tabs stay native, so `new_tab`, `goto_tab`,
+>   `move_tab` and the other tab keybindings work as before.
+> - **Archive** hides a tab without stopping what runs in it. **Archived** at the
+>   bottom of the sidebar lists archived tabs to restore or close. Archived tabs
+>   last until Ghostty quits.
 > - **View → Hide/Show Tab Sidebar** (<kbd>⌘</kbd><kbd>S</kbd>) toggles it and
 >   brings the horizontal tab bar back.
-> - Drag the divider to resize it (240–520pt); the width is remembered.
+> - Drag the divider to resize it (180–480pt); the width is remembered.
 >
 > The sidebar lives in
 > [`macos/Sources/Features/Terminal/TabSidebar`](macos/Sources/Features/Terminal/TabSidebar).

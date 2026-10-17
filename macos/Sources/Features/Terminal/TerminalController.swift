@@ -42,6 +42,9 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     /// early if we don't care.
     private var tabListenForFrame: Bool = false
 
+    /// The vertical tab sidebar for this window.
+    private var tabSidebarModel: TerminalTabSidebarModel?
+
     /// This is the hash value of the last tabGroup.windows array. We use this to detect order
     /// changes in the list.
     private var tabWindowsHash: Int = 0
@@ -666,6 +669,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
         // Call this last in case it uses any of the properties above.
         window.syncAppearance(surfaceConfig)
         terminalViewContainer?.ghosttyConfigDidChange(ghostty.config, preferredBackgroundColor: window.preferredBackgroundColor)
+        tabSidebarModel?.setNeedsRefresh()
     }
 
     /// Adjusts the given frame for the configured window position.
@@ -1114,6 +1118,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
 
         // Initialize our content view to the SwiftUI root
         let tabSidebarModel = TerminalTabSidebarModel(window: window)
+        self.tabSidebarModel = tabSidebarModel
         let container = TerminalViewContainer {
             TerminalTabSidebarLayout(model: tabSidebarModel) {
                 TerminalView(ghostty: ghostty, viewModel: self, delegate: self)

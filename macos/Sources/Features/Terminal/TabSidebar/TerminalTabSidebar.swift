@@ -1,9 +1,10 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Vertical tabs for a terminal window. Every native tab is its own window, so each
-/// window hosts a sidebar that lists the windows in its tab group. The look follows
-/// Steel's desktop chat sidebar: flat surface, 30pt rows, 10pt corners, 14pt type.
+/// window hosts a sidebar that lists the windows in its tab group. Colors come from
+/// the terminal theme so the sidebar reads as part of the terminal.
 enum TerminalTabSidebar {
     static let visibleKey = "TerminalTabSidebarVisible"
     static let widthKey = "TerminalTabSidebarWidth"
@@ -11,11 +12,11 @@ enum TerminalTabSidebar {
     /// Posted when the sidebar is shown or hidden so windows can swap the native tab bar.
     static let visibilityDidChange = Notification.Name("TerminalTabSidebarVisibilityDidChange")
 
-    static let defaultWidth: CGFloat = 275
-    static let minWidth: CGFloat = 240
-    static let maxWidth: CGFloat = 520
+    static let defaultWidth: CGFloat = 240
+    static let minWidth: CGFloat = 180
+    static let maxWidth: CGFloat = 480
     static let minTerminalWidth: CGFloat = 320
-    static let divider: CGFloat = 0.5
+    static let divider: CGFloat = 1
 
     static var isVisible: Bool {
         get { UserDefaults.ghostty.object(forKey: visibleKey) as? Bool ?? true }
@@ -39,10 +40,148 @@ enum TerminalTabSidebar {
     }
 }
 
+// MARK: - Theme
+
+/// The sidebar's colors and font, derived from the terminal theme.
+struct TerminalTabSidebarTheme: Equatable {
+    var background: NSColor
+    var foreground: NSColor
+    var fontFamily: String?
+
+    static let fallback = TerminalTabSidebarTheme(
+        background: .windowBackgroundColor,
+        foreground: .labelColor,
+        fontFamily: nil)
+
+    var backgroundColor: Color { Color(nsColor: background) }
+    var text: Color { Color(nsColor: foreground) }
+    var secondaryText: Color { Color(nsColor: foreground.withAlphaComponent(0.6)) }
+    var faintText: Color { Color(nsColor: foreground.withAlphaComponent(0.4)) }
+    var selected: Color { Color(nsColor: foreground.withAlphaComponent(0.1)) }
+    var hovered: Color { Color(nsColor: foreground.withAlphaComponent(0.05)) }
+    var hairline: Color { Color(nsColor: foreground.withAlphaComponent(0.08)) }
+
+    static let fontSize: CGFloat = 13
+
+    var font: Font {
+        if let fontFamily { return .custom(fontFamily, size: Self.fontSize) }
+        return .system(size: Self.fontSize)
+    }
+
+    var nsFont: NSFont {
+        fontFamily.flatMap { NSFont(name: $0, size: Self.fontSize) } ?? .systemFont(ofSize: Self.fontSize)
+    }
+}
+
+private enum TabSidebarTokens {
+    static let row: CGFloat = 28
+    static let rowGap: CGFloat = 2
+    static var rowPitch: CGFloat { row + rowGap }
+    static let rowRadius: CGFloat = 7
+    static let inset: CGFloat = 8
+}
+
+private enum TabSidebarMotion {
+    static let hover = Animation.easeOut(duration: 0.1)
+    static let reorder = Animation.easeOut(duration: 0.12)
+}
+
+// MARK: - Archive
+
+/// Archived tabs keep running in hidden windows until they are restored or closed.
+/// Archives last until Ghostty quits.
+final class TerminalTabArchive: ObservableObject {
+    static let shared = TerminalTabArchive()
+
+    struct Entry: Identifiable {
+        let id: ObjectIdentifier
+        let window: NSWindow
+        var title: String
+    }
+
+    @Published private(set) var entries: [Entry] = []
+
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        let center = NotificationCenter.default
+        observers.append(center.addObserver(
+            forName: NSWindow.willCloseNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let window = notification.object as? NSWindow else { return }
+            self?.entries.removeAll { $0.window === window }
+        })
+        observers.append(center.addObserver(
+            forName: TerminalWindow.titleDidChangeNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let self, let window = notification.object as? NSWindow,
+                  let index = self.entries.firstIndex(where: { $0.window === window }) else { return }
+            self.entries[index].title = Self.title(for: window)
+        })
+    }
+
+    static func title(for window: NSWindow) -> String {
+        window.title.isEmpty ? "Terminal" : window.title
+    }
+
+    /// Archives a tab. The last tab in a window can't be archived.
+    func archive(_ window: NSWindow) {
+        guard let tabGroup = window.tabGroup, tabGroup.windows.count > 1 else { return }
+
+        // Select a neighbor first so the window doesn't flash empty.
+        let windows = tabGroup.windows
+        if tabGroup.selectedWindow === window, let index = windows.firstIndex(of: window) {
+            let neighbor = index + 1 < windows.count ? windows[index + 1] : windows[index - 1]
+            neighbor.makeKeyAndOrderFront(nil)
+        }
+
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.current.duration = 0
+        tabGroup.removeWindow(window)
+        window.orderOut(nil)
+        NSAnimationContext.endGrouping()
+
+        window.isExcludedFromWindowsMenu = true
+        entries.insert(Entry(id: ObjectIdentifier(window), window: window, title: Self.title(for: window)), at: 0)
+    }
+
+    /// Restores an archived tab to the end of `host`'s tab group and selects it.
+    func restore(_ entry: Entry, into host: NSWindow) {
+        entries.removeAll { $0.id == entry.id }
+        entry.window.isExcludedFromWindowsMenu = false
+
+        let anchor = host.tabGroup?.windows.last ?? host
+        anchor.addTabbedWindowSafely(entry.window, ordered: .above)
+        entry.window.makeKeyAndOrderFront(nil)
+    }
+
+    /// Closes an archived tab, confirming first if a process is still running.
+    func close(_ entry: Entry) {
+        guard let controller = entry.window.windowController as? TerminalController else {
+            entries.removeAll { $0.id == entry.id }
+            entry.window.close()
+            return
+        }
+
+        if controller.surfaceTree.contains(where: { $0.needsConfirmQuit }) {
+            let alert = NSAlert()
+            alert.messageText = "Close Archived Tab?"
+            alert.informativeText = "The terminal still has a running process. If you close the tab the process will be killed."
+            alert.addButton(withTitle: "Close")
+            alert.addButton(withTitle: "Cancel")
+            alert.alertStyle = .warning
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+
+        entries.removeAll { $0.id == entry.id }
+        controller.closeWindowImmediately()
+    }
+}
+
 // MARK: - Model
 
 /// Mirrors the tab group of one window. Titles, order and selection come straight from
-/// AppKit, so native shortcuts (goto_tab, new_tab, close) keep working unchanged.
+/// AppKit, so native shortcuts (goto_tab, new_tab, move_tab, close) keep working unchanged.
 final class TerminalTabSidebarModel: ObservableObject {
     struct Tab: Identifiable, Equatable {
         let id: ObjectIdentifier
@@ -51,8 +190,12 @@ final class TerminalTabSidebarModel: ObservableObject {
     }
 
     @Published private(set) var tabs: [Tab] = []
+    @Published private(set) var theme: TerminalTabSidebarTheme = .fallback
 
-    private weak var window: NSWindow?
+    /// The tab being dragged, while a reorder is in progress.
+    private(set) var draggingID: ObjectIdentifier?
+
+    private(set) weak var window: NSWindow?
     private weak var observedTabGroup: NSWindowTabGroup?
     private var windowsObservation: NSKeyValueObservation?
     private var observers: [NSObjectProtocol] = []
@@ -81,6 +224,8 @@ final class TerminalTabSidebarModel: ObservableObject {
         windowsObservation?.invalidate()
     }
 
+    var canArchive: Bool { tabs.count > 1 }
+
     func select(_ tab: Tab) {
         window(for: tab)?.makeKeyAndOrderFront(nil)
     }
@@ -90,6 +235,16 @@ final class TerminalTabSidebarModel: ObservableObject {
         // Select first so a close confirmation appears on the visible tab.
         target.makeKeyAndOrderFront(nil)
         (target.windowController as? TerminalController)?.closeTab(nil)
+    }
+
+    func archive(_ tab: Tab) {
+        guard let target = window(for: tab) else { return }
+        TerminalTabArchive.shared.archive(target)
+    }
+
+    func restore(_ entry: TerminalTabArchive.Entry) {
+        guard let window else { return }
+        TerminalTabArchive.shared.restore(entry, into: window)
     }
 
     func rename(_ tab: Tab) {
@@ -102,12 +257,69 @@ final class TerminalTabSidebarModel: ObservableObject {
         (window?.windowController as? TerminalController)?.newTab(nil)
     }
 
+    // MARK: Reordering
+
+    func beginDrag(_ tab: Tab) {
+        draggingID = tab.id
+    }
+
+    /// Moves the dragged row to `index` in the sidebar only. AppKit's order changes on drop.
+    func previewDrag(to index: Int) {
+        guard let draggingID, let from = tabs.firstIndex(where: { $0.id == draggingID }) else { return }
+        let to = min(max(index, 0), tabs.count - 1)
+        guard from != to else { return }
+        var next = tabs
+        next.insert(next.remove(at: from), at: to)
+        withAnimation(TabSidebarMotion.reorder) { tabs = next }
+    }
+
+    func cancelDrag() {
+        guard draggingID != nil else { return }
+        draggingID = nil
+        setNeedsRefresh()
+    }
+
+    /// Applies the previewed order to the native tab group.
+    func commitDrag() {
+        defer {
+            draggingID = nil
+            setNeedsRefresh()
+        }
+
+        guard let draggingID,
+              let tabGroup = observedTabGroup,
+              let destination = tabs.firstIndex(where: { $0.id == draggingID }),
+              let moving = tabGroup.windows.first(where: { ObjectIdentifier($0) == draggingID }),
+              tabGroup.windows.firstIndex(of: moving) != destination else { return }
+
+        let selected = tabGroup.selectedWindow
+
+        NSAnimationContext.beginGrouping()
+        NSAnimationContext.current.duration = 0
+
+        tabGroup.removeWindow(moving)
+        let remaining = tabGroup.windows
+        if destination < remaining.count {
+            remaining[destination].addTabbedWindowSafely(moving, ordered: .below)
+        } else if let last = remaining.last {
+            last.addTabbedWindowSafely(moving, ordered: .above)
+        }
+        (selected ?? moving).makeKeyAndOrderFront(nil)
+
+        NSAnimationContext.endGrouping()
+
+        // Keep the goto_tab shortcut labels in sync with the new order.
+        (window?.windowController as? TerminalController)?.relabelTabs()
+    }
+
+    // MARK: Refresh
+
     private func window(for tab: Tab) -> NSWindow? {
         let windows = observedTabGroup?.windows ?? [window].compactMap { $0 }
         return windows.first { ObjectIdentifier($0) == tab.id }
     }
 
-    private func setNeedsRefresh() {
+    func setNeedsRefresh() {
         guard !refreshScheduled else { return }
         refreshScheduled = true
         DispatchQueue.main.async { [weak self] in
@@ -123,6 +335,9 @@ final class TerminalTabSidebarModel: ObservableObject {
             return
         }
 
+        let nextTheme = Self.theme(for: window)
+        if nextTheme != theme { theme = nextTheme }
+
         let tabGroup = window.tabGroup
         if tabGroup !== observedTabGroup {
             observedTabGroup = tabGroup
@@ -132,63 +347,32 @@ final class TerminalTabSidebarModel: ObservableObject {
             }
         }
 
+        // AppKit can recreate the tab bar when the group changes.
+        (window as? TerminalWindow)?.syncNativeTabBarVisibility()
+
+        // Don't fight an in-progress drag preview.
+        guard draggingID == nil else { return }
+
         let windows = tabGroup?.windows ?? [window]
         let selected = tabGroup?.selectedWindow ?? window
         let next = windows.map { tabWindow in
             Tab(
                 id: ObjectIdentifier(tabWindow),
-                title: tabWindow.title.isEmpty ? "Terminal" : tabWindow.title,
+                title: TerminalTabArchive.title(for: tabWindow),
                 isSelected: tabWindow === selected)
         }
         if next != tabs { tabs = next }
-
-        // AppKit can recreate the tab bar when the group changes.
-        (window as? TerminalWindow)?.syncNativeTabBarVisibility()
-    }
-}
-
-// MARK: - Design
-
-private enum TabSidebarPalette {
-    static let surface = adaptive(0xE0E0E0, 0x272727)
-    static let selected = adaptive(0xD2D2D2, 0x383838)
-    static let hovered = selected
-    static let text = adaptive(0x363636, 0xDFDFDF)
-    static let textSecondary = adaptive(0x5D5D5D, 0xAFAFAF)
-    static let hairline = Color(nsColor: NSColor(name: nil) { appearance in
-        isDark(appearance) ? NSColor.white.withAlphaComponent(0.1) : NSColor.black.withAlphaComponent(0.1)
-    })
-
-    static func adaptive(_ light: UInt32, _ dark: UInt32) -> Color {
-        Color(nsColor: NSColor(name: nil) { appearance in
-            rgb(isDark(appearance) ? dark : light)
-        })
     }
 
-    private static func isDark(_ appearance: NSAppearance) -> Bool {
-        appearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+    private static func theme(for window: NSWindow) -> TerminalTabSidebarTheme {
+        guard let config = (NSApp.delegate as? AppDelegate)?.ghostty.config else { return .fallback }
+        let background = (window as? TerminalWindow)?.preferredBackgroundColor
+            ?? NSColor(config.backgroundColor).withAlphaComponent(config.backgroundOpacity)
+        return TerminalTabSidebarTheme(
+            background: background,
+            foreground: NSColor(config.foregroundColor),
+            fontFamily: config.windowTitleFontFamily)
     }
-
-    private static func rgb(_ hex: UInt32) -> NSColor {
-        NSColor(
-            srgbRed: CGFloat((hex >> 16) & 0xFF) / 255,
-            green: CGFloat((hex >> 8) & 0xFF) / 255,
-            blue: CGFloat(hex & 0xFF) / 255,
-            alpha: 1)
-    }
-}
-
-private enum TabSidebarTokens {
-    static let row: CGFloat = 30
-    static let rowGap: CGFloat = 1
-    static let rowRadius: CGFloat = 10
-    static let inset: CGFloat = 8
-    static let fontSize: CGFloat = 14
-}
-
-private enum TabSidebarMotion {
-    static let hover = Animation.timingCurve(0.23, 1, 0.32, 1, duration: 0.15)
-    static let selection = Animation.timingCurve(0.19, 1, 0.22, 1, duration: 0.15)
 }
 
 // MARK: - Layout
@@ -224,7 +408,7 @@ struct TerminalTabSidebarLayout<Content: View>: View {
                 TerminalTabSidebarView(model: model)
                     .frame(width: width)
 
-                TabSidebarPalette.hairline
+                model.theme.hairline
                     .frame(width: TerminalTabSidebar.divider)
                     .ignoresSafeArea(.container, edges: .top)
             }
@@ -264,33 +448,134 @@ struct TerminalTabSidebarLayout<Content: View>: View {
 
 struct TerminalTabSidebarView: View {
     @ObservedObject var model: TerminalTabSidebarModel
+    @ObservedObject private var archive = TerminalTabArchive.shared
+    @State private var showsArchive = false
+
+    private var theme: TerminalTabSidebarTheme { model.theme }
 
     var body: some View {
-        TabSidebarScrollView(bottomContentInset: 16) {
-            TabSidebarAction(title: "New Tab", symbol: "plus", action: model.newTab)
-                .padding(.top, 8)
-                .padding(.bottom, 8)
-
-            VStack(alignment: .leading, spacing: TabSidebarTokens.rowGap) {
-                ForEach(model.tabs) { tab in
-                    TabSidebarRow(
-                        tab: tab,
-                        onSelect: { model.select(tab) },
-                        onClose: { model.close(tab) },
-                        onRename: { model.rename(tab) })
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    if showsArchive {
+                        archiveList
+                    } else {
+                        tabList
+                    }
                 }
+                .padding(.vertical, 8)
             }
-            .padding(.bottom, 16)
+            .scrollIndicators(.hidden)
+
+            TabSidebarActionRow(
+                title: showsArchive ? "Back to Tabs" : "Archived",
+                symbol: showsArchive ? "chevron.left" : "archivebox",
+                trailing: showsArchive || archive.entries.isEmpty ? nil : "\(archive.entries.count)",
+                theme: theme
+            ) {
+                showsArchive.toggle()
+            }
+            .padding(.vertical, 8)
         }
-        .background(TabSidebarPalette.surface.ignoresSafeArea(.container, edges: .top))
+        .background(theme.backgroundColor.ignoresSafeArea(.container, edges: .top))
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Tabs")
     }
+
+    @ViewBuilder
+    private var tabList: some View {
+        TabSidebarActionRow(title: "New Tab", symbol: "plus", theme: theme, action: model.newTab)
+            .padding(.bottom, 6)
+
+        VStack(alignment: .leading, spacing: TabSidebarTokens.rowGap) {
+            ForEach(model.tabs) { tab in
+                TabSidebarRow(
+                    title: tab.title,
+                    isSelected: tab.isSelected,
+                    theme: theme,
+                    actions: [
+                        .init(symbol: "archivebox", help: "Archive Tab", enabled: model.canArchive) { model.archive(tab) },
+                        .init(symbol: "xmark", help: "Close Tab") { model.close(tab) },
+                    ],
+                    onSelect: { model.select(tab) }
+                )
+                .contextMenu {
+                    Button("Rename Tab…") { model.rename(tab) }
+                    Button("Archive Tab") { model.archive(tab) }
+                        .disabled(!model.canArchive)
+                    Divider()
+                    Button("Close Tab") { model.close(tab) }
+                }
+                .onDrag {
+                    model.beginDrag(tab)
+                    return NSItemProvider(object: "ghostty-tab" as NSString)
+                }
+            }
+        }
+        .onDrop(of: [UTType.plainText], delegate: TabSidebarDropDelegate(model: model))
+    }
+
+    @ViewBuilder
+    private var archiveList: some View {
+        if archive.entries.isEmpty {
+            Text("No archived tabs")
+                .font(theme.font)
+                .foregroundColor(theme.faintText)
+                .padding(.horizontal, TabSidebarTokens.inset + 10)
+                .frame(height: TabSidebarTokens.row)
+        } else {
+            VStack(alignment: .leading, spacing: TabSidebarTokens.rowGap) {
+                ForEach(archive.entries) { entry in
+                    TabSidebarRow(
+                        title: entry.title,
+                        isSelected: false,
+                        theme: theme,
+                        actions: [
+                            .init(symbol: "arrow.uturn.left", help: "Restore Tab") { restore(entry) },
+                            .init(symbol: "xmark", help: "Close Tab") { archive.close(entry) },
+                        ],
+                        onSelect: { restore(entry) }
+                    )
+                    .contextMenu {
+                        Button("Restore Tab") { restore(entry) }
+                        Divider()
+                        Button("Close Tab") { archive.close(entry) }
+                    }
+                }
+            }
+        }
+    }
+
+    private func restore(_ entry: TerminalTabArchive.Entry) {
+        showsArchive = false
+        model.restore(entry)
+    }
 }
 
-private struct TabSidebarAction: View {
+/// Reorders with one drop target over the whole list; rows have a fixed pitch.
+private struct TabSidebarDropDelegate: DropDelegate {
+    let model: TerminalTabSidebarModel
+
+    func validateDrop(info: DropInfo) -> Bool { model.draggingID != nil }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        model.previewDrag(to: Int(info.location.y / TabSidebarTokens.rowPitch))
+        return DropProposal(operation: .move)
+    }
+
+    func dropExited(info: DropInfo) { model.cancelDrag() }
+
+    func performDrop(info: DropInfo) -> Bool {
+        model.commitDrag()
+        return true
+    }
+}
+
+private struct TabSidebarActionRow: View {
     let title: String
     let symbol: String
+    var trailing: String?
+    let theme: TerminalTabSidebarTheme
     let action: () -> Void
 
     @State private var isHovered = false
@@ -299,21 +584,26 @@ private struct TabSidebarAction: View {
         Button(action: action) {
             HStack(spacing: 8) {
                 Image(systemName: symbol)
-                    .font(.system(size: 13, weight: .regular))
+                    .font(.system(size: 12, weight: .regular))
                     .frame(width: 16, height: 16)
                 Text(title)
-                    .font(.system(size: TabSidebarTokens.fontSize, weight: .regular))
+                    .font(theme.font)
                 Spacer(minLength: 0)
+                if let trailing {
+                    Text(trailing)
+                        .font(theme.font)
+                        .foregroundColor(theme.faintText)
+                }
             }
-            .foregroundColor(TabSidebarPalette.text)
-            .padding(.horizontal, 8)
+            .foregroundColor(theme.secondaryText)
+            .padding(.horizontal, 10)
             .frame(height: TabSidebarTokens.row)
             .contentShape(RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous))
         }
         .buttonStyle(TabSidebarPressStyle())
         .background(
             RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous)
-                .fill(isHovered ? TabSidebarPalette.hovered : Color.clear))
+                .fill(isHovered ? theme.hovered : Color.clear))
         .onHover { hovering in
             withAnimation(TabSidebarMotion.hover) { isHovered = hovering }
         }
@@ -321,61 +611,74 @@ private struct TabSidebarAction: View {
     }
 }
 
+private struct TabSidebarRowAction {
+    let symbol: String
+    let help: String
+    var enabled = true
+    let perform: () -> Void
+}
+
 private struct TabSidebarRow: View {
-    let tab: TerminalTabSidebarModel.Tab
+    let title: String
+    let isSelected: Bool
+    let theme: TerminalTabSidebarTheme
+    let actions: [TabSidebarRowAction]
     let onSelect: () -> Void
-    let onClose: () -> Void
-    let onRename: () -> Void
 
     @State private var isHovered = false
 
+    private var actionsWidth: CGFloat { CGFloat(actions.count) * 22 + 4 }
+
     var body: some View {
         Button(action: onSelect) {
-            TabSidebarTitle(text: tab.title, isActive: isHovered, trailingInset: isHovered ? 24 : 0)
-                .foregroundColor(TabSidebarPalette.text)
-                .padding(.horizontal, 8)
+            TabSidebarTitle(
+                text: title,
+                font: theme.font,
+                nsFont: theme.nsFont,
+                isActive: isHovered,
+                trailingInset: isHovered ? actionsWidth : 0)
+                .foregroundColor(isSelected ? theme.text : theme.secondaryText)
+                .padding(.horizontal, 10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .frame(height: TabSidebarTokens.row)
                 .contentShape(RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous))
         }
         .buttonStyle(.plain)
         .overlay(alignment: .trailing) {
-            Button(action: onClose) {
-                Image(systemName: "xmark")
-                    .font(.system(size: 12, weight: .regular))
-                    .frame(width: 20, height: 20)
-                    .contentShape(Rectangle())
+            HStack(spacing: 2) {
+                ForEach(actions, id: \.symbol) { action in
+                    Button(action: action.perform) {
+                        Image(systemName: action.symbol)
+                            .font(.system(size: 11, weight: .regular))
+                            .frame(width: 20, height: 20)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(TabSidebarPressStyle())
+                    .foregroundColor(theme.secondaryText)
+                    .disabled(!action.enabled)
+                    .opacity(action.enabled ? 1 : 0.4)
+                    .help(action.help)
+                }
             }
-            .buttonStyle(TabSidebarPressStyle())
-            .foregroundColor(TabSidebarPalette.textSecondary)
-            .help("Close Tab")
-            .padding(.trailing, 8)
+            .padding(.trailing, 6)
             .opacity(isHovered ? 1 : 0)
             .allowsHitTesting(isHovered)
         }
         .background(
             RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous)
-                .fill(tab.isSelected
-                      ? TabSidebarPalette.selected
-                      : (isHovered ? TabSidebarPalette.hovered : Color.clear)))
+                .fill(isSelected ? theme.selected : (isHovered ? theme.hovered : Color.clear)))
         .onHover { hovering in
             withAnimation(TabSidebarMotion.hover) { isHovered = hovering }
         }
-        .contextMenu {
-            Button("Rename Tab…", action: onRename)
-            Divider()
-            Button("Close Tab", action: onClose)
-        }
-        .animation(TabSidebarMotion.selection, value: tab.isSelected)
         .padding(.horizontal, TabSidebarTokens.inset)
         .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(tab.isSelected ? [.isButton, .isSelected] : .isButton)
+        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
     }
 }
 
 private struct TabSidebarPressStyle: ButtonStyle {
     func makeBody(configuration: Configuration) -> some View {
-        configuration.label.opacity(configuration.isPressed ? 0.68 : 1)
+        configuration.label.opacity(configuration.isPressed ? 0.6 : 1)
     }
 }
 
@@ -384,6 +687,8 @@ private struct TabSidebarPressStyle: ButtonStyle {
 /// Long titles glide once to their end on hover after a short dwell, then stop.
 private struct TabSidebarTitle: View {
     let text: String
+    let font: Font
+    let nsFont: NSFont
     let isActive: Bool
     var trailingInset: CGFloat = 0
 
@@ -392,8 +697,7 @@ private struct TabSidebarTitle: View {
     @State private var isFinished = false
 
     private var textWidth: CGFloat {
-        let font = NSFont.systemFont(ofSize: TabSidebarTokens.fontSize, weight: .regular)
-        return ceil((text as NSString).size(withAttributes: [.font: font]).width)
+        ceil((text as NSString).size(withAttributes: [.font: nsFont]).width)
     }
 
     var body: some View {
@@ -406,7 +710,7 @@ private struct TabSidebarTitle: View {
                     ? TabSidebarTitleMotion.offset(elapsed: context.date.timeIntervalSince(startedAt), distance: distance)
                     : 0
                 Text(text)
-                    .font(.system(size: TabSidebarTokens.fontSize, weight: .regular))
+                    .font(font)
                     .lineLimit(1)
                     .fixedSize(horizontal: true, vertical: false)
                     .offset(x: -offset)
@@ -430,7 +734,7 @@ private struct TabSidebarTitle: View {
                     }
             }
         }
-        .frame(height: 20)
+        .frame(height: 18)
         .onChange(of: isActive) { _ in restart() }
         .onChange(of: text) { _ in restart() }
         .onChange(of: trailingInset) { _ in restart() }
@@ -449,9 +753,9 @@ private struct TabSidebarTitle: View {
 private enum TabSidebarTitleMotion {
     static let delay: TimeInterval = 0.35
 
-    static func offset(elapsed: TimeInterval, distance: CGFloat, fontSize: CGFloat = TabSidebarTokens.fontSize) -> CGFloat {
+    static func offset(elapsed: TimeInterval, distance: CGFloat) -> CGFloat {
         guard distance > 0, elapsed > delay else { return 0 }
-        let fraction = min(1, (elapsed - delay) / Double(distance / (fontSize * 2)))
+        let fraction = min(1, (elapsed - delay) / Double(distance / (TerminalTabSidebarTheme.fontSize * 2)))
         // Invert cubic-bezier(.49, .6, .7, 1) to evaluate progress by time.
         func cubic(_ t: Double, _ a: Double, _ b: Double) -> Double {
             let u = 1 - t
@@ -466,91 +770,9 @@ private enum TabSidebarTitleMotion {
     }
 }
 
-// MARK: - Scroll
-
-private struct TabSidebarContentFrameKey: PreferenceKey {
-    static var defaultValue: CGRect = .zero
-    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
-}
-
-/// A scroll view without indicators that fades its edges only when content is hidden there.
-private struct TabSidebarScrollView<Content: View>: View {
-    var bottomContentInset: CGFloat = 0
-    @ViewBuilder var content: () -> Content
-
-    @State private var showsTopEdge = false
-    @State private var showsBottomEdge = false
-    @State private var viewportHeight: CGFloat = 0
-
-    private static var space: String { "TabSidebarScroll" }
-
-    var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 0, content: content)
-                .background(GeometryReader { geometry in
-                    Color.clear.preference(
-                        key: TabSidebarContentFrameKey.self,
-                        value: geometry.frame(in: .named(Self.space)))
-                })
-        }
-        .coordinateSpace(name: Self.space)
-        .scrollIndicators(.hidden)
-        .background(GeometryReader { geometry in
-            Color.clear
-                .onAppear { viewportHeight = geometry.size.height }
-                .onChange(of: geometry.size.height) { viewportHeight = $0 }
-        })
-        .onPreferenceChange(TabSidebarContentFrameKey.self) { frame in
-            let top = frame.minY < -1
-            let bottom = frame.maxY - viewportHeight > bottomContentInset + 1
-            if showsTopEdge != top { showsTopEdge = top }
-            if showsBottomEdge != bottom { showsBottomEdge = bottom }
-        }
-        .overlay(alignment: .top) {
-            TabSidebarScrollEdge(top: true).opacity(showsTopEdge ? 1 : 0)
-        }
-        .overlay(alignment: .bottom) {
-            TabSidebarScrollEdge(top: false).opacity(showsBottomEdge ? 1 : 0)
-        }
-        .animation(.easeOut(duration: 0.12), value: showsTopEdge)
-        .animation(.easeOut(duration: 0.12), value: showsBottomEdge)
-    }
-}
-
-private struct TabSidebarScrollEdge: View {
-    let top: Bool
-    @Environment(\.accessibilityReduceTransparency) private var reduceTransparency
-
-    private var start: UnitPoint { top ? .top : .bottom }
-    private var end: UnitPoint { top ? .bottom : .top }
-
-    var body: some View {
-        Rectangle()
-            .fill(.ultraThinMaterial)
-            .overlay {
-                LinearGradient(stops: [
-                    .init(color: TabSidebarPalette.surface, location: 0),
-                    .init(color: TabSidebarPalette.surface.opacity(reduceTransparency ? 1 : 0.65), location: 0.4),
-                    .init(color: TabSidebarPalette.surface.opacity(reduceTransparency ? 1 : 0), location: 1),
-                ], startPoint: start, endPoint: end)
-            }
-            .mask {
-                LinearGradient(stops: [
-                    .init(color: .black, location: 0),
-                    .init(color: .black.opacity(0.9), location: 0.25),
-                    .init(color: .black.opacity(0.35), location: 0.65),
-                    .init(color: .clear, location: 1),
-                ], startPoint: start, endPoint: end)
-            }
-            .frame(height: 32)
-            .allowsHitTesting(false)
-            .accessibilityHidden(true)
-    }
-}
-
 // MARK: - Resize
 
-/// A 10pt hit region over the hairline. It must consume drags even though the
+/// A 10pt hit region over the divider. It must consume drags even though the
 /// window background is movable.
 private struct TabSidebarResizeHandle: NSViewRepresentable {
     let width: CGFloat

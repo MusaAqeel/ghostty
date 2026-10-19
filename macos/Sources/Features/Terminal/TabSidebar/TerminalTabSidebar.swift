@@ -1,6 +1,5 @@
 import AppKit
 import SwiftUI
-import UniformTypeIdentifiers
 
 /// Vertical tabs for a terminal window. Every native tab is its own window, so each
 /// window hosts a sidebar that lists the windows in its tab group. Colors come from
@@ -193,7 +192,11 @@ final class TerminalTabSidebarModel: ObservableObject {
     @Published private(set) var theme: TerminalTabSidebarTheme = .fallback
 
     /// The tab being dragged, while a reorder is in progress.
-    private(set) var draggingID: ObjectIdentifier?
+    @Published private(set) var draggingID: ObjectIdentifier?
+
+    /// How far the dragged row sits from its slot, so it follows the pointer.
+    @Published private(set) var dragOffset: CGFloat = 0
+    private var dragStartIndex = 0
 
     private(set) weak var window: NSWindow?
     private weak var observedTabGroup: NSWindowTabGroup?
@@ -268,30 +271,34 @@ final class TerminalTabSidebarModel: ObservableObject {
 
     // MARK: Reordering
 
-    func beginDrag(_ tab: Tab) {
-        draggingID = tab.id
+    /// Moves the dragged row in the sidebar only, by whole rows of `translation`.
+    /// AppKit's order changes when the drag ends.
+    func drag(_ tab: Tab, translation: CGFloat) {
+        if draggingID == nil {
+            guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
+            draggingID = tab.id
+            dragStartIndex = index
+        }
+        guard let from = tabs.firstIndex(where: { $0.id == draggingID }) else { return }
+
+        let pitch = TabSidebarTokens.rowPitch
+        let to = min(max(dragStartIndex + Int((translation / pitch).rounded()), 0), tabs.count - 1)
+        if from != to {
+            var next = tabs
+            next.insert(next.remove(at: from), at: to)
+            withAnimation(TabSidebarMotion.reorder) { tabs = next }
+        }
+        dragOffset = translation - CGFloat(to - dragStartIndex) * pitch
     }
 
-    /// Moves the dragged row to `index` in the sidebar only. AppKit's order changes on drop.
-    func previewDrag(to index: Int) {
-        guard let draggingID, let from = tabs.firstIndex(where: { $0.id == draggingID }) else { return }
-        let to = min(max(index, 0), tabs.count - 1)
-        guard from != to else { return }
-        var next = tabs
-        next.insert(next.remove(at: from), at: to)
-        withAnimation(TabSidebarMotion.reorder) { tabs = next }
-    }
-
-    func cancelDrag() {
-        guard draggingID != nil else { return }
-        draggingID = nil
-        setNeedsRefresh()
-    }
-
-    /// Applies the previewed order to the native tab group.
-    func commitDrag() {
+    /// Applies the dragged order to the native tab group.
+    func endDrag() {
         defer {
-            draggingID = nil
+            // Settle the row into its slot.
+            withAnimation(TabSidebarMotion.reorder) {
+                draggingID = nil
+                dragOffset = 0
+            }
             setNeedsRefresh()
         }
 
@@ -515,13 +522,16 @@ struct TerminalTabSidebarView: View {
                     Divider()
                     Button("Close Tab") { model.close(tab) }
                 }
-                .onDrag {
-                    model.beginDrag(tab)
-                    return NSItemProvider(object: "ghostty-tab" as NSString)
-                }
+                .offset(y: model.draggingID == tab.id ? model.dragOffset : 0)
+                .zIndex(model.draggingID == tab.id ? 1 : 0)
+                // The dragged row tracks the pointer; only its neighbors animate.
+                .transaction { if model.draggingID == tab.id { $0.animation = nil } }
+                .gesture(
+                    DragGesture(minimumDistance: 4, coordinateSpace: .global)
+                        .onChanged { model.drag(tab, translation: $0.translation.height) }
+                        .onEnded { _ in model.endDrag() })
             }
         }
-        .onDrop(of: [UTType.plainText], delegate: TabSidebarDropDelegate(model: model))
     }
 
     @ViewBuilder
@@ -558,25 +568,6 @@ struct TerminalTabSidebarView: View {
     private func restore(_ entry: TerminalTabArchive.Entry) {
         showsArchive = false
         model.restore(entry)
-    }
-}
-
-/// Reorders with one drop target over the whole list; rows have a fixed pitch.
-private struct TabSidebarDropDelegate: DropDelegate {
-    let model: TerminalTabSidebarModel
-
-    func validateDrop(info: DropInfo) -> Bool { model.draggingID != nil }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        model.previewDrag(to: Int(info.location.y / TabSidebarTokens.rowPitch))
-        return DropProposal(operation: .move)
-    }
-
-    func dropExited(info: DropInfo) { model.cancelDrag() }
-
-    func performDrop(info: DropInfo) -> Bool {
-        model.commitDrag()
-        return true
     }
 }
 
@@ -639,49 +630,49 @@ private struct TabSidebarRow: View {
     private var actionsWidth: CGFloat { CGFloat(actions.count) * 22 + 4 }
 
     var body: some View {
-        Button(action: onSelect) {
-            TabSidebarTitle(
-                text: title,
-                font: theme.font,
-                nsFont: theme.nsFont,
-                isActive: isHovered,
-                trailingInset: isHovered ? actionsWidth : 0)
-                .foregroundColor(isSelected ? theme.text : theme.secondaryText)
-                .padding(.horizontal, 10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .frame(height: TabSidebarTokens.row)
-                .contentShape(RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous))
-        }
-        .buttonStyle(.plain)
-        .overlay(alignment: .trailing) {
-            HStack(spacing: 2) {
-                ForEach(actions, id: \.symbol) { action in
-                    Button(action: action.perform) {
-                        Image(systemName: action.symbol)
-                            .font(.system(size: 11, weight: .regular))
-                            .frame(width: 20, height: 20)
-                            .contentShape(Rectangle())
+        // A tap rather than a Button, so a drag on the row can reorder it.
+        TabSidebarTitle(
+            text: title,
+            font: theme.font,
+            nsFont: theme.nsFont,
+            isActive: isHovered,
+            trailingInset: isHovered ? actionsWidth : 0)
+            .foregroundColor(isSelected ? theme.text : theme.secondaryText)
+            .padding(.horizontal, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .frame(height: TabSidebarTokens.row)
+            .contentShape(RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous))
+            .onTapGesture(perform: onSelect)
+            .overlay(alignment: .trailing) {
+                HStack(spacing: 2) {
+                    ForEach(actions, id: \.symbol) { action in
+                        Button(action: action.perform) {
+                            Image(systemName: action.symbol)
+                                .font(.system(size: 11, weight: .regular))
+                                .frame(width: 20, height: 20)
+                                .contentShape(Rectangle())
+                        }
+                        .buttonStyle(TabSidebarPressStyle())
+                        .foregroundColor(theme.secondaryText)
+                        .disabled(!action.enabled)
+                        .opacity(action.enabled ? 1 : 0.4)
+                        .help(action.help)
                     }
-                    .buttonStyle(TabSidebarPressStyle())
-                    .foregroundColor(theme.secondaryText)
-                    .disabled(!action.enabled)
-                    .opacity(action.enabled ? 1 : 0.4)
-                    .help(action.help)
                 }
+                .padding(.trailing, 6)
+                .opacity(isHovered ? 1 : 0)
+                .allowsHitTesting(isHovered)
             }
-            .padding(.trailing, 6)
-            .opacity(isHovered ? 1 : 0)
-            .allowsHitTesting(isHovered)
-        }
-        .background(
-            RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous)
-                .fill(isSelected ? theme.selected : (isHovered ? theme.hovered : Color.clear)))
-        .onHover { hovering in
-            withAnimation(TabSidebarMotion.hover) { isHovered = hovering }
-        }
-        .padding(.horizontal, TabSidebarTokens.inset)
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+            .background(
+                RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous)
+                    .fill(isSelected ? theme.selected : (isHovered ? theme.hovered : Color.clear)))
+            .onHover { hovering in
+                withAnimation(TabSidebarMotion.hover) { isHovered = hovering }
+            }
+            .padding(.horizontal, TabSidebarTokens.inset)
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(isSelected ? [.isButton, .isSelected] : .isButton)
+            .accessibilityAction(.default, onSelect)
     }
 }
 

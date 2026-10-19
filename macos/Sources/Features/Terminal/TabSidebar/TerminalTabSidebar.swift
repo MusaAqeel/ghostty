@@ -204,19 +204,28 @@ final class TerminalTabSidebarModel: ObservableObject {
     init(window: NSWindow) {
         self.window = window
 
-        let names: [Notification.Name] = [
+        // Selection and titles refresh in the same pass as the change. A new tab is
+        // added to its group before it becomes key, so its first frame already shows
+        // the full list instead of an empty, unthemed sidebar.
+        let immediate: [Notification.Name] = [
             NSWindow.didBecomeKeyNotification,
             NSWindow.didBecomeMainNotification,
-            NSWindow.willCloseNotification,
             TerminalWindow.titleDidChangeNotification,
         ]
-        observers = names.map { name in
+        observers = immediate.map { name in
             NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
-                self?.setNeedsRefresh()
+                self?.refresh()
             }
         }
 
-        setNeedsRefresh()
+        // A closing window is still in its group, so wait a turn.
+        observers.append(NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.setNeedsRefresh()
+        })
+
+        refresh()
     }
 
     deinit {

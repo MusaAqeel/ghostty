@@ -25,6 +25,35 @@ enum TerminalTabSidebar {
         }
     }
 
+    static let sortKey = "TerminalTabSidebarSort"
+
+    /// Posted when the sort order setting changes.
+    static let sortDidChange = Notification.Name("TerminalTabSidebarSortDidChange")
+
+    /// How the sidebar orders tabs. Manual follows the native tab order, which
+    /// dragging rearranges. Last Messaged lists the most recently messaged tab first.
+    enum Sort: String, CaseIterable, Identifiable {
+        case manual
+        case lastMessaged
+
+        var id: Self { self }
+
+        var title: String {
+            switch self {
+            case .manual: "Manual"
+            case .lastMessaged: "Last Messaged"
+            }
+        }
+    }
+
+    static var sort: Sort {
+        get { UserDefaults.ghostty.string(forKey: sortKey).flatMap(Sort.init(rawValue:)) ?? .manual }
+        set {
+            UserDefaults.ghostty.set(newValue.rawValue, forKey: sortKey)
+            NotificationCenter.default.post(name: sortDidChange, object: nil)
+        }
+    }
+
     static var currentWidth: CGFloat {
         let stored = UserDefaults.ghostty.object(forKey: widthKey) as? Double
         return clampedWidth(stored.map { CGFloat($0) } ?? defaultWidth, containerWidth: 0)
@@ -83,6 +112,50 @@ private enum TabSidebarTokens {
 private enum TabSidebarMotion {
     static let hover = Animation.easeOut(duration: 0.1)
     static let reorder = Animation.easeOut(duration: 0.12)
+}
+
+// MARK: - Activity
+
+/// When each tab was last messaged: the last time Return was pressed in its
+/// terminal. A tab counts as messaged when it is first seen. Dates last until
+/// Ghostty quits.
+final class TerminalTabActivity {
+    static let shared = TerminalTabActivity()
+
+    /// Posted with the messaged window as the object.
+    static let didChange = Notification.Name("TerminalTabActivityDidChange")
+
+    private var dates: [ObjectIdentifier: Date] = [:]
+    private var observer: NSObjectProtocol?
+
+    private init() {
+        observer = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification, object: nil, queue: .main
+        ) { [weak self] notification in
+            guard let window = notification.object as? NSWindow else { return }
+            self?.dates[ObjectIdentifier(window)] = nil
+        }
+    }
+
+    func date(for window: NSWindow) -> Date {
+        let id = ObjectIdentifier(window)
+        if let date = dates[id] { return date }
+        let now = Date()
+        dates[id] = now
+        return now
+    }
+
+    /// Called for every key down in the app. Plain Return in a terminal sends a
+    /// message; Shift-Return and other chords only edit it.
+    func noteKeyDown(_ event: NSEvent) {
+        guard event.keyCode == 36 || event.keyCode == 76,
+              !event.isARepeat,
+              event.modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty,
+              let window = event.window as? TerminalWindow,
+              window.firstResponder is Ghostty.SurfaceView else { return }
+        dates[ObjectIdentifier(window)] = Date()
+        NotificationCenter.default.post(name: Self.didChange, object: window)
+    }
 }
 
 // MARK: - Archive
@@ -188,8 +261,20 @@ final class TerminalTabSidebarModel: ObservableObject {
         let isSelected: Bool
     }
 
+    /// What the sidebar shows above its footer.
+    enum Page {
+        case tabs
+        case archive
+        case settings
+    }
+
     @Published private(set) var tabs: [Tab] = []
     @Published private(set) var theme: TerminalTabSidebarTheme = .fallback
+    @Published private(set) var sort: TerminalTabSidebar.Sort = TerminalTabSidebar.sort
+    @Published var page: Page = .tabs
+
+    /// Tabs can be dragged only in the manual order.
+    var canReorder: Bool { sort == .manual }
 
     /// The tab being dragged, while a reorder is in progress.
     @Published private(set) var draggingID: ObjectIdentifier?
@@ -227,6 +312,16 @@ final class TerminalTabSidebarModel: ObservableObject {
         ) { [weak self] _ in
             self?.setNeedsRefresh()
         })
+
+        let reorders: [Notification.Name] = [
+            TerminalTabSidebar.sortDidChange,
+            TerminalTabActivity.didChange,
+        ]
+        observers += reorders.map { name in
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.refresh()
+            }
+        }
 
         refresh()
     }
@@ -269,11 +364,16 @@ final class TerminalTabSidebarModel: ObservableObject {
         (window?.windowController as? TerminalController)?.newTab(nil)
     }
 
+    func setSort(_ sort: TerminalTabSidebar.Sort) {
+        TerminalTabSidebar.sort = sort
+    }
+
     // MARK: Reordering
 
     /// Moves the dragged row in the sidebar only, by whole rows of `translation`.
     /// AppKit's order changes when the drag ends.
     func drag(_ tab: Tab, translation: CGFloat) {
+        guard canReorder else { return }
         if draggingID == nil {
             guard let index = tabs.firstIndex(where: { $0.id == tab.id }) else { return }
             draggingID = tab.id
@@ -369,7 +469,20 @@ final class TerminalTabSidebarModel: ObservableObject {
         // Don't fight an in-progress drag preview.
         guard draggingID == nil else { return }
 
-        let windows = tabGroup?.windows ?? [window]
+        let nextSort = TerminalTabSidebar.sort
+        if nextSort != sort { sort = nextSort }
+
+        var windows = tabGroup?.windows ?? [window]
+
+        // Reading the dates also stamps tabs seen for the first time.
+        let dates = windows.map { TerminalTabActivity.shared.date(for: $0) }
+        if sort == .lastMessaged {
+            // Newest first; ties keep the native order.
+            windows = windows.indices
+                .sorted { dates[$0] != dates[$1] ? dates[$0] > dates[$1] : $0 < $1 }
+                .map { windows[$0] }
+        }
+
         let selected = tabGroup?.selectedWindow ?? window
         let next = windows.map { tabWindow in
             Tab(
@@ -377,7 +490,16 @@ final class TerminalTabSidebarModel: ObservableObject {
                 title: TerminalTabArchive.title(for: tabWindow),
                 isSelected: tabWindow === selected)
         }
-        if next != tabs { tabs = next }
+        guard next != tabs else { return }
+
+        // Slide rows when only the order changed, such as a tab moving to the top
+        // after a message. Anything else, like a new tab, appears in place.
+        if !tabs.isEmpty, next.map(\.id).sorted() == tabs.map(\.id).sorted(),
+           next.map(\.id) != tabs.map(\.id) {
+            withAnimation(TabSidebarMotion.reorder) { tabs = next }
+        } else {
+            tabs = next
+        }
     }
 
     private static func theme(for window: NSWindow) -> TerminalTabSidebarTheme {
@@ -465,7 +587,6 @@ struct TerminalTabSidebarLayout<Content: View>: View {
 struct TerminalTabSidebarView: View {
     @ObservedObject var model: TerminalTabSidebarModel
     @ObservedObject private var archive = TerminalTabArchive.shared
-    @State private var showsArchive = false
 
     private var theme: TerminalTabSidebarTheme { model.theme }
 
@@ -473,25 +594,18 @@ struct TerminalTabSidebarView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
-                    if showsArchive {
-                        archiveList
-                    } else {
-                        tabList
+                    switch model.page {
+                    case .tabs: tabList
+                    case .archive: archiveList
+                    case .settings: settings
                     }
                 }
                 .padding(.vertical, 8)
             }
             .scrollIndicators(.hidden)
 
-            TabSidebarActionRow(
-                title: showsArchive ? "Back to Tabs" : "Archived",
-                symbol: showsArchive ? "chevron.left" : "archivebox",
-                trailing: showsArchive || archive.entries.isEmpty ? nil : "\(archive.entries.count)",
-                theme: theme
-            ) {
-                showsArchive.toggle()
-            }
-            .padding(.vertical, 8)
+            footer
+                .padding(.vertical, 8)
         }
         .background(theme.backgroundColor.ignoresSafeArea(.container, edges: .top))
         .accessibilityElement(children: .contain)
@@ -529,7 +643,56 @@ struct TerminalTabSidebarView: View {
                 .gesture(
                     DragGesture(minimumDistance: 4, coordinateSpace: .global)
                         .onChanged { model.drag(tab, translation: $0.translation.height) }
-                        .onEnded { _ in model.endDrag() })
+                        .onEnded { _ in model.endDrag() },
+                    including: model.canReorder ? .all : .subviews)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var footer: some View {
+        if model.page == .tabs {
+            HStack(spacing: 2) {
+                TabSidebarActionRow(
+                    title: "Archived",
+                    symbol: "archivebox",
+                    trailing: archive.entries.isEmpty ? nil : "\(archive.entries.count)",
+                    horizontalInset: 0,
+                    theme: theme
+                ) {
+                    model.page = .archive
+                }
+
+                TabSidebarIconButton(symbol: "gearshape", help: "Sidebar Settings", theme: theme) {
+                    model.page = .settings
+                }
+            }
+            .padding(.horizontal, TabSidebarTokens.inset)
+        } else {
+            TabSidebarActionRow(title: "Back to Tabs", symbol: "chevron.left", theme: theme) {
+                model.page = .tabs
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var settings: some View {
+        Text("Sort Tabs")
+            .font(.system(size: 11, weight: .medium))
+            .foregroundColor(theme.faintText)
+            .padding(.horizontal, TabSidebarTokens.inset + 10)
+            .frame(height: 22)
+
+        VStack(alignment: .leading, spacing: TabSidebarTokens.rowGap) {
+            ForEach(TerminalTabSidebar.Sort.allCases) { option in
+                TabSidebarActionRow(
+                    title: option.title,
+                    symbol: model.sort == option ? "checkmark" : nil,
+                    theme: theme
+                ) {
+                    model.setSort(option)
+                }
+                .accessibilityAddTraits(model.sort == option ? .isSelected : [])
             }
         }
     }
@@ -566,15 +729,45 @@ struct TerminalTabSidebarView: View {
     }
 
     private func restore(_ entry: TerminalTabArchive.Entry) {
-        showsArchive = false
+        model.page = .tabs
         model.restore(entry)
+    }
+}
+
+private struct TabSidebarIconButton: View {
+    let symbol: String
+    let help: String
+    let theme: TerminalTabSidebarTheme
+    let action: () -> Void
+
+    @State private var isHovered = false
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: symbol)
+                .font(.system(size: 12, weight: .regular))
+                .frame(width: TabSidebarTokens.row, height: TabSidebarTokens.row)
+                .contentShape(RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous))
+        }
+        .buttonStyle(TabSidebarPressStyle())
+        .foregroundColor(theme.secondaryText)
+        .background(
+            RoundedRectangle(cornerRadius: TabSidebarTokens.rowRadius, style: .continuous)
+                .fill(isHovered ? theme.hovered : Color.clear))
+        .onHover { hovering in
+            withAnimation(TabSidebarMotion.hover) { isHovered = hovering }
+        }
+        .help(help)
+        .accessibilityLabel(help)
     }
 }
 
 private struct TabSidebarActionRow: View {
     let title: String
-    let symbol: String
+    /// Without a symbol the title keeps its indent, like an unchecked menu item.
+    let symbol: String?
     var trailing: String?
+    var horizontalInset = TabSidebarTokens.inset
     let theme: TerminalTabSidebarTheme
     let action: () -> Void
 
@@ -583,9 +776,13 @@ private struct TabSidebarActionRow: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 8) {
-                Image(systemName: symbol)
-                    .font(.system(size: 12, weight: .regular))
-                    .frame(width: 16, height: 16)
+                Group {
+                    if let symbol {
+                        Image(systemName: symbol)
+                            .font(.system(size: 12, weight: .regular))
+                    }
+                }
+                .frame(width: 16, height: 16)
                 Text(title)
                     .font(theme.font)
                 Spacer(minLength: 0)
@@ -607,7 +804,7 @@ private struct TabSidebarActionRow: View {
         .onHover { hovering in
             withAnimation(TabSidebarMotion.hover) { isHovered = hovering }
         }
-        .padding(.horizontal, TabSidebarTokens.inset)
+        .padding(.horizontal, horizontalInset)
     }
 }
 

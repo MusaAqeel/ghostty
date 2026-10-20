@@ -43,7 +43,7 @@ class TerminalController: BaseTerminalController, TabGroupCloseCoordinator.Contr
     private var tabListenForFrame: Bool = false
 
     /// The vertical tab sidebar for this window.
-    private var tabSidebarModel: TerminalTabSidebarModel?
+    private(set) var tabSidebarModel: TerminalTabSidebarModel?
 
     /// This is the hash value of the last tabGroup.windows array. We use this to detect order
     /// changes in the list.

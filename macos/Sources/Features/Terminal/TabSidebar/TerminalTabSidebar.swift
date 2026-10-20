@@ -368,6 +368,49 @@ final class TerminalTabSidebarModel: ObservableObject {
         TerminalTabSidebar.sort = sort
     }
 
+    // MARK: Search
+
+    @Published private(set) var isSearching = false
+    let search = TerminalTabSearchModel()
+
+    func toggleSearch() {
+        if isSearching {
+            closeSearch()
+        } else {
+            search.open()
+            isSearching = true
+        }
+    }
+
+    func closeSearch(restoringFocus: Bool = true) {
+        guard isSearching else { return }
+        isSearching = false
+        search.close()
+
+        guard restoringFocus, let window,
+              let surface = (window.windowController as? BaseTerminalController)?.focusedSurface else { return }
+        DispatchQueue.main.async { window.makeFirstResponder(surface) }
+    }
+
+    /// Switches to the result's tab, restoring it here if it was archived.
+    func openSearchResult(_ result: TerminalTabSearchModel.Result) {
+        let target = search.window(for: result.id)
+        closeSearch(restoringFocus: target === window)
+
+        if result.isArchived,
+           let entry = TerminalTabArchive.shared.entries.first(where: { $0.id == result.id }) {
+            restore(entry)
+        } else {
+            target?.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func showSettings() {
+        closeSearch()
+        page = .settings
+        if !TerminalTabSidebar.isVisible { TerminalTabSidebar.isVisible = true }
+    }
+
     // MARK: Reordering
 
     /// Moves the dragged row in the sidebar only, by whole rows of `translation`.
@@ -579,6 +622,16 @@ struct TerminalTabSidebarLayout<Content: View>: View {
                 .onAppear { containerWidth = geometry.size.width }
                 .onChange(of: geometry.size.width) { containerWidth = $0 }
         })
+        .overlay {
+            if model.isSearching {
+                TerminalTabSearchView(
+                    search: model.search,
+                    theme: model.theme,
+                    onOpen: model.openSearchResult,
+                    onSettings: model.showSettings,
+                    onClose: { model.closeSearch() })
+            }
+        }
     }
 }
 

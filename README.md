@@ -12,6 +12,12 @@
 > - **Archive** hides a tab without stopping what runs in it. **Archived** at the
 >   bottom of the sidebar lists archived tabs to restore or close. Archived tabs
 >   last until Ghostty quits.
+> - **Search Tabs** (<kbd>⌘</kbd><kbd>K</kbd>) finds any open or archived tab by
+>   title or terminal text, with the matching line and when it was last
+>   messaged. It replaces the default `clear_screen` binding on ⌘K.
+> - The gear next to **Archived** opens sidebar settings. **Sort Tabs** is
+>   **Manual** (drag to reorder) or **Last Messaged** (the tab where you last
+>   pressed Return comes first).
 > - **View → Hide/Show Tab Sidebar** (<kbd>⌘</kbd><kbd>S</kbd>) toggles it and
 >   brings the horizontal tab bar back.
 > - Drag the divider to resize it (180–480pt); the width is remembered.

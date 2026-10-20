@@ -625,6 +625,9 @@ class AppDelegate: NSObject,
         // Track when each tab was last messaged for the tab sidebar's sort.
         TerminalTabActivity.shared.noteKeyDown(event)
 
+        // ⌘K searches tabs. It runs before key bindings so it wins over clear_screen.
+        if TerminalTabSearch.handleKeyDown(event) { return nil }
+
         // If the tab overview is visible and escape is pressed, close it.
         // This can't POSSIBLY be right and is probably a FirstResponder problem
         // that we should handle elsewhere in our program. But this works and it
@@ -1171,10 +1174,24 @@ extension AppDelegate {
         item.setImageIfDesired(systemSymbolName: "sidebar.left")
         viewMenu.addItem(.separator())
         viewMenu.addItem(item)
+
+        // ⌘K itself is handled in localEventKeyDown; the item shows the shortcut.
+        let search = NSMenuItem(
+            title: "Search Tabs",
+            action: #selector(searchTabs(_:)),
+            keyEquivalent: "k")
+        search.keyEquivalentModifierMask = .command
+        search.target = self
+        search.setImageIfDesired(systemSymbolName: "magnifyingglass")
+        viewMenu.addItem(search)
     }
 
     @IBAction func toggleTabSidebar(_ sender: Any?) {
         TerminalTabSidebar.isVisible.toggle()
+    }
+
+    @IBAction func searchTabs(_ sender: Any?) {
+        (NSApp.keyWindow?.windowController as? TerminalController)?.tabSidebarModel?.toggleSearch()
     }
 
     /// Setup all the images for our menu items.
@@ -1366,6 +1383,9 @@ extension AppDelegate: NSMenuItemValidation {
         case #selector(toggleTabSidebar(_:)):
             item.title = TerminalTabSidebar.isVisible ? "Hide Tab Sidebar" : "Show Tab Sidebar"
             return true
+
+        case #selector(searchTabs(_:)):
+            return NSApp.keyWindow?.windowController is TerminalController
 
         case #selector(undo(_:)):
             if undoManager.canUndo {
